@@ -1158,6 +1158,7 @@ type SendMessageRequest struct {
 	Recipient       string `json:"recipient"`
 	Message         string `json:"message"`
 	MediaPath       string `json:"media_path,omitempty"`
+	AsSticker       bool   `json:"as_sticker,omitempty"`
 	QuotedMessageID string `json:"quoted_message_id,omitempty"`
 	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
 	QuotedContent   string `json:"quoted_content,omitempty"`
@@ -1230,6 +1231,99 @@ func outboundMediaRow(mediaPath string, upload whatsmeow.UploadResponse) (mediaT
 	return mediaType, filename, upload.URL, upload.MediaKey, upload.FileSHA256, upload.FileEncSHA256, upload.FileLength
 }
 
+// validateStickerRequest rejects an as_sticker request before any upload
+// happens, based on the filename alone. This is a cheap, early check for
+// the common mistake (pointing as_sticker at a .jpg); it does not prove
+// the file's contents are actually webp — see isRealWebP for that, which
+// runs after the file is read.
+func validateStickerRequest(asSticker bool, mediaPath string) error {
+	if !asSticker {
+		return nil
+	}
+	if mediaPath == "" {
+		return fmt.Errorf("as_sticker requires a media_path")
+	}
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
+	if ext != "webp" {
+		return fmt.Errorf("as_sticker requires a .webp file, got .%s", ext)
+	}
+	return nil
+}
+
+// isRealWebP reports whether data starts with a RIFF/WEBP container
+// signature. A file merely named *.webp isn't proof of that — renaming a
+// .jpg to .webp passes validateStickerRequest, uploads fine, and WhatsApp
+// acks it as a sticker without ever rendering it, which is the exact
+// silent failure this whole feature exists to avoid.
+func isRealWebP(data []byte) bool {
+	return len(data) >= 12 && bytes.Equal(data[0:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP"))
+}
+
+// isAnimatedWebP reports whether a webp file is animated, per the
+// ANIMATION bit (0x02) of its VP8X extended-header flags byte. A plain
+// substring search for "ANIM" (an earlier version of this function) false
+// -positives on static files whose metadata happens to contain that text
+// — "ANIME" in a sticker-pack tag, for instance — because it isn't aware
+// of the container at all. A file with no VP8X chunk (plain VP8/VP8L) is
+// never animated.
+func isAnimatedWebP(data []byte) bool {
+	if !isRealWebP(data) || len(data) < 21 {
+		return false
+	}
+	if !bytes.Equal(data[12:16], []byte("VP8X")) {
+		return false
+	}
+	const animationFlag = 0x02
+	return data[20]&animationFlag != 0
+}
+
+// storedContentForSend returns the text to persist as an outbound message's
+// content. StickerMessage has no caption field — persisting the original
+// message text for a sticker send would leave the local DB claiming the
+// recipient got a caption that was never actually sent. Gated on
+// mediaType == "sticker" rather than a bare asSticker bool: mediaType only
+// becomes "sticker" once mediaPath has been validated as a real .webp (see
+// the call site in sendWhatsAppMessage), so this can't accidentally blank
+// out a real text message sent with asSticker=true and no media attached.
+func storedContentForSend(message, mediaType string) string {
+	if mediaType == "sticker" {
+		return ""
+	}
+	return message
+}
+
+// attachImageOrSticker sets msg.StickerMessage or msg.ImageMessage from an
+// uploaded MediaImage, depending on asSticker. Split out from
+// sendWhatsAppMessage so this branch is unit-testable without a live
+// whatsmeow.Client — the caller (sendWhatsAppMessage) already guarantees
+// mediaPath is a real .webp whenever asSticker is true. Stickers carry no
+// caption.
+func attachImageOrSticker(msg *waProto.Message, asSticker bool, mimeType string, mediaData []byte, message string, resp whatsmeow.UploadResponse) {
+	if asSticker {
+		msg.StickerMessage = &waProto.StickerMessage{
+			Mimetype:      proto.String(mimeType),
+			URL:           &resp.URL,
+			DirectPath:    &resp.DirectPath,
+			MediaKey:      resp.MediaKey,
+			FileEncSHA256: resp.FileEncSHA256,
+			FileSHA256:    resp.FileSHA256,
+			FileLength:    &resp.FileLength,
+			IsAnimated:    proto.Bool(isAnimatedWebP(mediaData)),
+		}
+		return
+	}
+	msg.ImageMessage = &waProto.ImageMessage{
+		Caption:       proto.String(message),
+		Mimetype:      proto.String(mimeType),
+		URL:           &resp.URL,
+		DirectPath:    &resp.DirectPath,
+		MediaKey:      resp.MediaKey,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    &resp.FileLength,
+	}
+}
+
 func buildDisappearingMode() *waProto.DisappearingMode {
 	return &waProto.DisappearingMode{
 		Initiator: waProto.DisappearingMode_CHANGED_IN_CHAT.Enum(),
@@ -1263,6 +1357,8 @@ func applyChatEphemeralSettings(msg *waProto.Message, settings ChatEphemeralSett
 		msg.VideoMessage.ContextInfo = mergeEphemeralContextInfo(msg.VideoMessage.GetContextInfo(), settings)
 	case msg.DocumentMessage != nil:
 		msg.DocumentMessage.ContextInfo = mergeEphemeralContextInfo(msg.DocumentMessage.GetContextInfo(), settings)
+	case msg.StickerMessage != nil:
+		msg.StickerMessage.ContextInfo = mergeEphemeralContextInfo(msg.StickerMessage.GetContextInfo(), settings)
 	case msg.Conversation != nil:
 		text := msg.GetConversation()
 		msg.Conversation = nil
@@ -1436,7 +1532,7 @@ func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, asSticker bool, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -1477,10 +1573,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		if err := validateStickerRequest(asSticker, mediaPath); err != nil {
+			return false, err.Error()
+		}
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
+		}
+
+		if asSticker && !isRealWebP(mediaData) {
+			return false, "as_sticker requires real webp file data, not just a .webp extension"
 		}
 
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
@@ -1509,16 +1613,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Create the appropriate message type based on media type
 		switch mediaType {
 		case whatsmeow.MediaImage:
-			msg.ImageMessage = &waProto.ImageMessage{
-				Caption:       proto.String(message),
-				Mimetype:      proto.String(mimeType),
-				URL:           &upload.URL,
-				DirectPath:    &upload.DirectPath,
-				MediaKey:      upload.MediaKey,
-				FileEncSHA256: upload.FileEncSHA256,
-				FileSHA256:    upload.FileSHA256,
-				FileLength:    &upload.FileLength,
-			}
+			attachImageOrSticker(msg, asSticker, mimeType, mediaData, message, upload)
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
 			var seconds uint32 = 30 // Default fallback
@@ -1653,6 +1748,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 
 		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := outboundMediaRow(mediaPath, upload)
+		// asSticker overrides "image" to "sticker"; it's safe to do
+		// unconditionally because validateStickerRequest + isRealWebP
+		// already guarantee mediaPath is a real .webp whenever asSticker
+		// is true. The rest of the upload metadata (url/mediaKey/etc.)
+		// still applies so a sticker can be redownloaded like any other
+		// attachment.
+		if asSticker {
+			mediaType = "sticker"
+		}
 
 		// Pass empty name so StoreChat preserves any existing resolved
 		// contact/group name; we don't have one available here and
@@ -1660,8 +1764,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		if chatErr := messageStore.StoreChat(chatJID, "", timestamp); chatErr != nil {
 			fmt.Printf("Warning: failed to store outbound chat metadata: %v\n", chatErr)
 		}
+		storedContent := storedContentForSend(message, mediaType)
 		if storeErr := messageStore.StoreMessage(
-			resp.ID, chatJID, senderUser, message, timestamp, true,
+			resp.ID, chatJID, senderUser, storedContent, timestamp, true,
 			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMsgID,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
@@ -2457,13 +2562,51 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			resolvedMediaPath = canonical
 		}
 
+		// Reject a malformed as_sticker request here, as a client input
+		// error (400), rather than letting it fall through to
+		// sendWhatsAppMessage and come back as a generic 500 — the caller
+		// sent something wrong, the bridge didn't break. Both the
+		// filename check and the real-content check happen here so a
+		// renamed .jpg gets the same 400 treatment as a plain wrong
+		// extension, instead of only the cheaper check being promoted.
+		if req.AsSticker {
+			if err := validateStickerRequest(true, resolvedMediaPath); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: err.Error(),
+				})
+				return
+			}
+			data, readErr := os.ReadFile(resolvedMediaPath)
+			if readErr != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Error reading media file: %v", readErr),
+				})
+				return
+			}
+			if !isRealWebP(data) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: "as_sticker requires real webp file data, not just a .webp extension",
+				})
+				return
+			}
+		}
+
 		// Avoid logging req.Message verbatim — it's user content and may
 		// contain secrets the user pasted into a chat.
 		fmt.Printf("→ /api/send recipient=%q message_len=%d has_media=%v\n",
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.AsSticker, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
