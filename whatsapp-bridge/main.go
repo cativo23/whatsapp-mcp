@@ -1250,13 +1250,34 @@ func validateStickerRequest(asSticker bool, mediaPath string) error {
 	return nil
 }
 
-// isRealWebP reports whether data starts with a RIFF/WEBP container
-// signature. A file merely named *.webp isn't proof of that — renaming a
-// .jpg to .webp passes validateStickerRequest, uploads fine, and WhatsApp
-// acks it as a sticker without ever rendering it, which is the exact
-// silent failure this whole feature exists to avoid.
+// isRealWebP reports whether data is a well-formed RIFF/WEBP container. A
+// file merely named *.webp isn't proof of that — renaming a .jpg to .webp
+// passes validateStickerRequest, uploads fine, and WhatsApp acks it as a
+// sticker without ever rendering it, which is the exact silent failure
+// this whole feature exists to avoid. Checking only the RIFF/WEBP magic
+// bytes isn't enough either: a truncated header or arbitrary data with
+// that 12-byte prefix would still pass and hit the same failure, so this
+// also checks the declared RIFF size against the actual length and
+// requires a real WebP image sub-chunk (VP8 /VP8L/VP8X) right after it.
 func isRealWebP(data []byte) bool {
-	return len(data) >= 12 && bytes.Equal(data[0:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP"))
+	if len(data) < 16 {
+		return false
+	}
+	if !bytes.Equal(data[0:4], []byte("RIFF")) || !bytes.Equal(data[8:12], []byte("WEBP")) {
+		return false
+	}
+	// RIFF's declared size covers everything after these first 8 bytes;
+	// a mismatch means truncated or padded data, not a well-formed file.
+	riffSize := binary.LittleEndian.Uint32(data[4:8])
+	if uint64(riffSize) != uint64(len(data)-8) {
+		return false
+	}
+	switch string(data[12:16]) {
+	case "VP8 ", "VP8L", "VP8X":
+		return true
+	default:
+		return false
+	}
 }
 
 // isAnimatedWebP reports whether a webp file is animated, per the

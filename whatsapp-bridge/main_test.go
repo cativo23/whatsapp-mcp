@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -3399,12 +3400,21 @@ func TestSendHandler_AsStickerRealWebp_PassesValidation(t *testing.T) {
 // buildVP8XWebP returns a minimal but structurally real webp file with a
 // VP8X extended-header chunk carrying the given flags byte — enough for
 // isRealWebP and isAnimatedWebP to parse, without a real image payload.
+// The RIFF size field is set correctly so isRealWebP's size check passes.
 func buildVP8XWebP(flags byte) []byte {
 	data := make([]byte, 30)
 	copy(data[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(data)-8))
 	copy(data[8:12], "WEBP")
 	copy(data[12:16], "VP8X")
 	data[20] = flags
+	return data
+}
+
+// setRIFFSize rewrites data's RIFF size field to match its actual length,
+// for tests that append bytes to a fixture built by buildVP8XWebP.
+func setRIFFSize(data []byte) []byte {
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(data)-8))
 	return data
 }
 
@@ -3481,6 +3491,38 @@ func TestIsRealWebP_TooShort_ReturnsFalse(t *testing.T) {
 	}
 }
 
+// TestIsRealWebP_TruncatedRiffSize_ReturnsFalse and
+// TestIsRealWebP_GarbageAfterMagicBytes_ReturnsFalse are regression tests
+// for a gap found in external review (Codex, PR #224): the original
+// isRealWebP checked only the 12-byte RIFF/WEBP magic prefix, so a
+// truncated header or arbitrary data sharing that prefix still passed —
+// uploaded fine, acked by WhatsApp, never rendered. The same silent
+// failure the whole check exists to prevent, one layer deeper.
+func TestIsRealWebP_TruncatedRiffSize_ReturnsFalse(t *testing.T) {
+	data := buildVP8XWebP(0x00)
+	// Declare a RIFF size far larger than the actual data — a truncated
+	// or corrupted download, not a well-formed file.
+	binary.LittleEndian.PutUint32(data[4:8], 9999)
+	if isRealWebP(data) {
+		t.Fatal("expected isRealWebP to reject a RIFF size that doesn't match the actual data length")
+	}
+}
+
+func TestIsRealWebP_GarbageAfterMagicBytes_ReturnsFalse(t *testing.T) {
+	// Correct RIFF/WEBP magic bytes and a correct declared size, but the
+	// chunk after "WEBP" isn't one of the three real image sub-chunks —
+	// the exact shape of "arbitrary non-image data with that prefix"
+	// Codex's review called out.
+	data := make([]byte, 20)
+	copy(data[0:4], "RIFF")
+	copy(data[8:12], "WEBP")
+	copy(data[12:16], "JUNK")
+	setRIFFSize(data)
+	if isRealWebP(data) {
+		t.Fatal("expected isRealWebP to reject a file with no real WebP image sub-chunk")
+	}
+}
+
 func TestIsAnimatedWebP_StaticVP8X_ReturnsFalse(t *testing.T) {
 	if isAnimatedWebP(buildVP8XWebP(0x00)) {
 		t.Fatal("expected isAnimatedWebP to return false when the ANIMATION flag bit is unset")
@@ -3503,6 +3545,7 @@ func TestIsAnimatedWebP_PlainVP8NoExtendedHeader_ReturnsFalse(t *testing.T) {
 	copy(data[0:4], "RIFF")
 	copy(data[8:12], "WEBP")
 	copy(data[12:16], "VP8 ")
+	setRIFFSize(data)
 	if isAnimatedWebP(data) {
 		t.Fatal("expected isAnimatedWebP to return false for a plain VP8 file with no VP8X chunk")
 	}
@@ -3515,6 +3558,7 @@ func TestIsAnimatedWebP_PlainVP8NoExtendedHeader_ReturnsFalse(t *testing.T) {
 func TestIsAnimatedWebP_StaticFileWithAnimTextInMetadata_ReturnsFalse(t *testing.T) {
 	data := buildVP8XWebP(0x00) // ANIMATION bit unset
 	data = append(data, []byte("some ANIME sticker pack metadata")...)
+	setRIFFSize(data)
 	if isAnimatedWebP(data) {
 		t.Fatal("expected isAnimatedWebP to ignore the literal text \"ANIME\" outside the VP8X flags byte")
 	}
