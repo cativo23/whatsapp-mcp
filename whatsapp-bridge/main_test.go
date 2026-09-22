@@ -2936,6 +2936,44 @@ func TestOutboundMediaRow_PopulatedUpload_SatisfiesRedownloadCheck(t *testing.T)
 	}
 }
 
+// TestOutboundMediaRow_PreservesMetadataForAllMediaTypes verifies that each
+// outbound category stores the upload metadata needed by downloadMedia.
+func TestOutboundMediaRow_PreservesMetadataForAllMediaTypes(t *testing.T) {
+	upload := whatsmeow.UploadResponse{
+		URL:           "https://mmg.whatsapp.net/v/t62.7161-24/upload.enc",
+		MediaKey:      []byte{0x01, 0x02, 0x03, 0x04},
+		FileSHA256:    []byte{0xaa, 0xbb, 0xcc},
+		FileEncSHA256: []byte{0xdd, 0xee, 0xff},
+		FileLength:    30524,
+	}
+	cases := []struct {
+		path      string
+		mediaType string
+	}{
+		{path: "/tmp/wa-test/photo.jpg", mediaType: "image"},
+		{path: "/tmp/wa-test/voice.ogg", mediaType: "audio"},
+		{path: "/tmp/wa-test/clip.mp4", mediaType: "video"},
+		{path: "/tmp/wa-test/report.pdf", mediaType: "document"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.mediaType, func(t *testing.T) {
+			gotType, _, gotURL, gotKey, gotSHA, gotEncSHA, gotLength := outboundMediaRow(tc.path, upload)
+			if gotType != tc.mediaType {
+				t.Errorf("mediaType = %q, want %q", gotType, tc.mediaType)
+			}
+			if !hasCompleteMediaInfo(gotURL, gotKey, gotSHA, gotEncSHA, gotLength) {
+				t.Fatal("outbound media row is incomplete")
+			}
+			if gotURL != upload.URL || !bytes.Equal(gotKey, upload.MediaKey) ||
+				!bytes.Equal(gotSHA, upload.FileSHA256) || !bytes.Equal(gotEncSHA, upload.FileEncSHA256) ||
+				gotLength != upload.FileLength {
+				t.Fatal("outbound media metadata does not match the upload response")
+			}
+		})
+	}
+}
+
 // TestOutboundMediaRow_EmptyMediaPath_ReturnsEmpty verifies the text-message
 // case (mediaPath == "") stays a no-media row, matching the previous
 // inline behavior exactly — no ambiguity between "no media" and "upload
@@ -3032,5 +3070,68 @@ func TestStoreMessage_EmptyMediaFields_FailsRedownloadCheck(t *testing.T) {
 	gotURL, gotKey, gotSHA, gotEncSHA, gotLen := queryMediaFields(t, ms, chatJID, "OUTBOUND2")
 	if hasCompleteMediaInfo(gotURL, gotKey, gotSHA, gotEncSHA, gotLen) {
 		t.Fatalf("expected incomplete media info (the pre-fix bug shape), got a complete row")
+	}
+}
+
+// TestRenderPairingQRCodes_RendersEveryCode is the regression guard for the
+// rotated-code path. WhatsApp answers a QR scan with a companion_reg_refresh
+// notification, whatsmeow rotates the ADV secret and pushes a fresh code down
+// the channel, and only that rotated code can still complete the handshake.
+// Rendering only the first code leaves a stale one on screen: the phone then
+// validates against a secret the server has already dropped and reports
+// "check your connection" while pairing never completes.
+func TestRenderPairingQRCodes_RendersEveryCode(t *testing.T) {
+	qrChan := make(chan whatsmeow.QRChannelItem, 3)
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "first-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "rotated-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "success"}
+	close(qrChan)
+
+	var rendered []string
+	var out strings.Builder
+	outcome := renderPairingQRCodes(qrChan, &out, func(code string, w io.Writer) {
+		rendered = append(rendered, code)
+	})
+
+	if outcome != pairingQRSucceeded {
+		t.Errorf("outcome = %v, want pairingQRSucceeded", outcome)
+	}
+	want := []string{"first-code", "rotated-code"}
+	if len(rendered) != len(want) {
+		t.Fatalf("rendered %d code(s) (%v), want %d — a rotated code that is never\n"+
+			"rendered cannot be scanned, which is exactly how pairing stalls", len(rendered), rendered, len(want))
+	}
+	for i := range want {
+		if rendered[i] != want[i] {
+			t.Errorf("rendered[%d] = %q, want %q", i, rendered[i], want[i])
+		}
+	}
+	if !strings.Contains(out.String(), "refreshed") {
+		t.Errorf("second code was not announced as refreshed; output:\n%s", out.String())
+	}
+}
+
+// TestRenderPairingQRCodes_Outcomes covers the two non-success verdicts: the
+// server running out of codes, and the channel draining without a verdict.
+func TestRenderPairingQRCodes_Outcomes(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []whatsmeow.QRChannelItem
+		want  pairingQROutcome
+	}{
+		{"timeout", []whatsmeow.QRChannelItem{{Event: "code", Code: "c"}, {Event: "timeout"}}, pairingQRTimedOut},
+		{"closed without verdict", []whatsmeow.QRChannelItem{{Event: "code", Code: "c"}}, pairingQRChannelClosed},
+		{"unknown events are skipped", []whatsmeow.QRChannelItem{{Event: "err-unexpected-state"}}, pairingQRChannelClosed},
+	}
+	for _, c := range cases {
+		qrChan := make(chan whatsmeow.QRChannelItem, len(c.items))
+		for _, it := range c.items {
+			qrChan <- it
+		}
+		close(qrChan)
+		got := renderPairingQRCodes(qrChan, io.Discard, func(code string, w io.Writer) {})
+		if got != c.want {
+			t.Errorf("%s: outcome = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
