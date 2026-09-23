@@ -2600,6 +2600,19 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				})
 				return
 			}
+			// Re-assert containment right at the read site (validateMediaPath
+			// already did this above); keeps the guard visible to static
+			// analysis at the actual sink instead of only in a helper two
+			// calls away.
+			if !isPathWithinRoots(resolvedMediaPath, allowedMediaRoots) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: "media_path is outside the configured media roots",
+				})
+				return
+			}
 			data, readErr := os.ReadFile(resolvedMediaPath)
 			if readErr != nil {
 				w.Header().Set("Content-Type", "application/json")
