@@ -2631,7 +2631,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			}
 			fileInfo, statErr := mediaFile.Stat()
 			if statErr != nil || !fileInfo.Mode().IsRegular() {
-				mediaFile.Close()
+				_ = mediaFile.Close()
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
 				_ = json.NewEncoder(w).Encode(SendMessageResponse{
@@ -2641,7 +2641,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				return
 			}
 			data, readErr := io.ReadAll(mediaFile)
-			mediaFile.Close()
+			_ = mediaFile.Close()
 			if readErr != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
