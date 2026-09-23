@@ -2613,7 +2613,35 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				})
 				return
 			}
-			data, readErr := os.ReadFile(resolvedMediaPath)
+			// Open once and read from the resulting descriptor rather than
+			// os.ReadFile, which internally stats and opens the path again.
+			// That narrows the window between the containment check above
+			// and the actual read to a single open() syscall instead of a
+			// separate stat+open+read sequence — a symlink or hardlink
+			// swapped into place after validation can't redirect this read.
+			mediaFile, openErr := os.Open(resolvedMediaPath)
+			if openErr != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Error reading media file: %v", openErr),
+				})
+				return
+			}
+			fileInfo, statErr := mediaFile.Stat()
+			if statErr != nil || !fileInfo.Mode().IsRegular() {
+				mediaFile.Close()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{
+					Success: false,
+					Message: "media_path is not a regular file",
+				})
+				return
+			}
+			data, readErr := io.ReadAll(mediaFile)
+			mediaFile.Close()
 			if readErr != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
