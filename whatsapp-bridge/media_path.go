@@ -126,13 +126,7 @@ func validateMediaPath(mediaPath string, allowedRoots []string) (string, error) 
 }
 
 // isPathWithinRoots reports whether path is the same as, or a strict
-// descendant of, one of roots. Exported as its own function (rather than
-// inlined in validateMediaPath) so call sites that read a file some time
-// after validation — e.g. the as_sticker content check in /api/send — can
-// re-assert containment right next to the read. That keeps the guard
-// visible to static analysis at the actual sink, and keeps a future
-// refactor that drops the earlier validateMediaPath call from silently
-// regressing into a path-traversal read.
+// descendant of, one of roots.
 func isPathWithinRoots(path string, roots []string) bool {
 	for _, root := range roots {
 		if pathHasPrefix(path, root) {
@@ -146,15 +140,17 @@ func isPathWithinRoots(path string, roots []string) bool {
 // strict descendant. Plain string-prefix matching is unsafe ("/foo/bar"
 // would match "/foo/barbaz"), so we require either exact match or an
 // explicit separator after parent.
+//
+// Keep the strings.HasPrefix(child, ...) check dominating the only return
+// that can yield true: that is the shape CodeQL's go/path-injection
+// barrier-guard model needs to treat this function (and isPathWithinRoots,
+// validateMediaPath on top of it) as a containment check.
 func pathHasPrefix(child, parent string) bool {
-	if child == parent {
-		return true
-	}
 	if !strings.HasPrefix(child, parent) {
 		return false
 	}
 	rest := child[len(parent):]
-	return strings.HasPrefix(rest, string(os.PathSeparator))
+	return rest == "" || strings.HasPrefix(rest, string(os.PathSeparator))
 }
 
 // outboundFileName returns the name a RECIPIENT should see for an outbound

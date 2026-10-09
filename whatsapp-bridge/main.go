@@ -2568,7 +2568,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		// Validate and canonicalize media_path against the configured roots
 		// before reading. This prevents the bridge from being used as a
 		// generic file-read primitive (e.g. media_path=/Users/x/.ssh/id_rsa).
-		resolvedMediaPath := req.MediaPath
+		// Start from "" rather than req.MediaPath so the only non-empty value
+		// that can reach a file read is the validated canonical path.
+		resolvedMediaPath := ""
 		if req.MediaPath != "" {
 			canonical, mpErr := validateMediaPath(req.MediaPath, allowedMediaRoots)
 			if mpErr != nil {
@@ -2597,19 +2599,6 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				_ = json.NewEncoder(w).Encode(SendMessageResponse{
 					Success: false,
 					Message: err.Error(),
-				})
-				return
-			}
-			// Re-assert containment right at the read site (validateMediaPath
-			// already did this above); keeps the guard visible to static
-			// analysis at the actual sink instead of only in a helper two
-			// calls away.
-			if !isPathWithinRoots(resolvedMediaPath, allowedMediaRoots) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusForbidden)
-				_ = json.NewEncoder(w).Encode(SendMessageResponse{
-					Success: false,
-					Message: "media_path is outside the configured media roots",
 				})
 				return
 			}
